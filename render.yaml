@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: xconnecttest
+    runtime: python
+    buildCommand: "echo 'no build needed'"
+    startCommand: "python3 server.py"
